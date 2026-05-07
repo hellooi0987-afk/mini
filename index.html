@@ -270,7 +270,8 @@ const DISP = {
 
 // ─── CLOCK ────────────────────────────────────────────────────────────────────
 function tickClock() {
-  document.getElementById('clockEl').textContent = new Date().toUTCString().slice(17,25) + ' UTC';
+  const n=new Date(); const p=v=>String(v).padStart(2,'0');
+  document.getElementById('clockEl').textContent = p(n.getUTCHours())+':'+p(n.getUTCMinutes())+':'+p(n.getUTCSeconds())+' UTC';
 }
 tickClock(); setInterval(tickClock, 1000);
 
@@ -284,144 +285,22 @@ function fmt(v, sym='') {
   return v.toFixed(4);
 }
 
-// ─── API CALLS — direct public APIs, no backend required ─────────────────────
-
-// Map internal symbol → Binance pair
-function toBinanceSym(sym) {
-  const map = { BTCUSD:'BTCUSDT', ETHUSD:'ETHUSDT', SOLUSD:'SOLUSDT',
-                XRPUSD:'XRPUSDT', BNBUSD:'BNBUSDT', ADAUSD:'ADAUSDT',
-                DOTUSD:'DOTUSDT', LTCUSD:'LTCUSDT', AVAXUSD:'AVAXUSDT',
-                LINKUSD:'LINKUSDT', MATICUSD:'MATICUSDT' };
-  return map[sym] || null;
-}
-
-// Binance interval map
-function toBinanceInterval(tf) {
-  const map = { '1min':'1m','5min':'5m','15min':'15m','1h':'1h','4h':'4h','1day':'1d' };
-  return map[tf] || '15m';
-}
-
-// Fetch candles from Binance (crypto) or generate synthetic forex data
+// ─── API CALLS (all hit our own /api routes on Vercel) ────────────────────────
 async function apiCandles(sym, tf, size=150) {
-  const binSym = toBinanceSym(sym);
-
-  if (binSym) {
-    // ── CRYPTO via Binance public API ──
-    const interval = toBinanceInterval(tf);
-    const url = `https://api.binance.com/api/v3/klines?symbol=${binSym}&interval=${interval}&limit=${size}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
-    if (!r.ok) throw new Error(`Binance API error ${r.status}`);
-    const raw = await r.json();
-    if (!Array.isArray(raw) || raw.length === 0) throw new Error('No candle data returned');
-    const candles = raw.map(k => ({
-      time:   Math.floor(k[0] / 1000),
-      open:   parseFloat(k[1]),
-      high:   parseFloat(k[2]),
-      low:    parseFloat(k[3]),
-      close:  parseFloat(k[4]),
-      volume: parseFloat(k[5]),
-    }));
-    return { candles, source: 'Binance' };
-  }
-
-  // ── FOREX / GOLD via Frankfurter + fallback synthetic ──
-  // Use exchangerate.host for latest forex, then build synthetic candles
-  const forexBase = sym.slice(0, 3);
-  const forexQuote = sym.slice(3, 6);
-  try {
-    const url = `https://api.frankfurter.app/latest?from=${forexBase}&to=${forexQuote}`;
-    const r = await fetch(url, { signal: AbortSignal.timeout(10000) });
-    if (!r.ok) throw new Error(`Forex API ${r.status}`);
-    const d = await r.json();
-    const rate = d.rates?.[forexQuote];
-    if (!rate) throw new Error('Rate not found');
-    // Build synthetic candles around live rate
-    const candles = buildSyntheticCandles(rate, sym, size, tf);
-    return { candles, source: 'Frankfurter' };
-  } catch(e) {
-    // Last-resort: use stored approximate rates
-    const FALLBACK = {
-      EURUSD:1.0820, GBPUSD:1.2700, USDJPY:154.50, USDCHF:0.9050,
-      AUDUSD:0.6450, USDCAD:1.3650, NZDUSD:0.5950, EURGBP:0.8520,
-      EURJPY:167.20, GBPJPY:196.20, XAUUSD:2320.0, XAGUSD:27.50,
-    };
-    const base = FALLBACK[sym];
-    if (!base) throw new Error(`Symbol ${sym} not supported`);
-    const candles = buildSyntheticCandles(base, sym, size, tf);
-    return { candles, source: 'Estimated' };
-  }
+  const r = await fetch(`/api/market?symbol=${sym}&interval=${tf}&outputsize=${size}`, {
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!r.ok) throw new Error(`Market API error ${r.status}`);
+  const d = await r.json();
+  if (!d.ok) throw new Error(d.error || 'No data');
+  return { candles: d.candles, source: d.source };
 }
 
-// Generate realistic-looking synthetic candles around a known price
-function buildSyntheticCandles(basePrice, sym, count, tf) {
-  const vol = basePrice * 0.0008; // ~0.08% volatility per candle
-  const tfSeconds = { '1min':60,'5min':300,'15min':900,'1h':3600,'4h':14400,'1day':86400 };
-  const step = tfSeconds[tf] || 900;
-  const now = Math.floor(Date.now() / 1000);
-  const candles = [];
-  let price = basePrice * (0.992 + Math.random() * 0.016);
-  for (let i = count - 1; i >= 0; i--) {
-    const drift = (Math.random() - 0.499) * vol * 2;
-    const open = price;
-    price = Math.max(open + drift, open * 0.001);
-    const hi = Math.max(open, price) + Math.random() * vol;
-    const lo = Math.min(open, price) - Math.random() * vol;
-    candles.push({
-      time: now - i * step,
-      open: +open.toFixed(6),
-      high: +hi.toFixed(6),
-      low:  +lo.toFixed(6),
-      close:+price.toFixed(6),
-      volume: +(Math.random() * 1000 + 100).toFixed(2),
-    });
-  }
-  // Nudge last candle close toward the actual live rate
-  const last = candles[candles.length - 1];
-  last.close = +basePrice.toFixed(6);
-  last.high  = Math.max(last.high, last.close);
-  last.low   = Math.min(last.low,  last.close);
-  return candles;
-}
-
-// Fetch live prices for watchlist
 async function apiPrices(syms) {
-  const result = {};
-  const cryptoSyms  = syms.filter(s => toBinanceSym(s));
-  const forexSyms   = syms.filter(s => !toBinanceSym(s));
-
-  // Crypto: Binance ticker (one call for all)
-  if (cryptoSyms.length) {
-    try {
-      const pairs = cryptoSyms.map(toBinanceSym).filter(Boolean);
-      const qs = encodeURIComponent(JSON.stringify(pairs));
-      const r  = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbols=${qs}`, { signal: AbortSignal.timeout(8000) });
-      if (r.ok) {
-        const data = await r.json();
-        for (const t of data) {
-          const internal = cryptoSyms.find(s => toBinanceSym(s) === t.symbol);
-          if (internal) result[internal] = {
-            price:     parseFloat(t.lastPrice),
-            changePct: parseFloat(t.priceChangePercent),
-          };
-        }
-      }
-    } catch(_) {}
-  }
-
-  // Forex: Frankfurter for a subset
-  for (const sym of forexSyms) {
-    try {
-      const base = sym.slice(0,3), quote = sym.slice(3,6);
-      const r = await fetch(`https://api.frankfurter.app/latest?from=${base}&to=${quote}`, { signal: AbortSignal.timeout(6000) });
-      if (r.ok) {
-        const d = await r.json();
-        const rate = d.rates?.[quote];
-        if (rate) result[sym] = { price: rate, changePct: 0 };
-      }
-    } catch(_) {}
-  }
-
-  return result;
+  const r = await fetch(`/api/price?symbols=${syms.join(',')}`, { signal: AbortSignal.timeout(8000) });
+  if (!r.ok) return {};
+  const d = await r.json();
+  return d.prices || {};
 }
 
 // ─── TECHNICAL ANALYSIS (pure JS — zero cost) ─────────────────────────────────
@@ -784,7 +663,7 @@ function changeTF(tf) {
   curTF = tf;
   document.querySelectorAll('.tf-btn').forEach(b => {
     const map = {'1min':'1m','5min':'5m','15min':'15m','1h':'1h','4h':'4h','1day':'1D'};
-    b.classList.toggle('active', map[tf]===b.textContent);
+    b.classList.toggle('active', (map[tf]||'').toLowerCase()===b.textContent.toLowerCase());
   });
   loadSym(curSym);
 }
